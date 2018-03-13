@@ -1,0 +1,221 @@
+---
+title: "Online Supplement to 'QC-ART&#58; A tool for real-time quality control assessment of mass spectrometry-based proteomics data'"
+author: "Bryan A. Stanfill, Ernesto S. Nakayasu, Lisa M. Bramer, Allison M. Thompson, Charles Ansong, Therese R. Clauss, Marina A. Gritsenko, Matthew E. Monroe, Ronald J. Moore, Daniel J. Orton, Paul D. Piehowski, Athena A. Schepmoes, Richard D. Smith, Bobbie-Jo M. Webb-Robertson, Thomas O. Metz; TEDDY Study Group"
+date: ""
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(shiny)
+library(plotly)
+```
+
+
+
+```{r eruptions, echo=FALSE}
+
+ui <- fluidPage(
+  
+  sidebarLayout(
+    sidebarPanel(HTML("<b>Data upload settings</b>"),
+    # Input: Checkbox if file has header ----
+    checkboxInput("header", "Header", TRUE),
+    # Input: Select separator ----
+    radioButtons("sep", "Separator",choices = c(Comma = ",",Semicolon = ";",Tab = "\t"),selected = ","),
+    # Input: Date column ----
+    numericInput("date_col", label="Date Column Number",value=1),
+    # Input: date format ------
+    radioButtons("dformat","Date Format",choices=c("Month/Day/Year"="mdy","Day/Month/Year"="dmy","Year/Month/Day"="ymd","No dates"="nd")),
+    #File upload ----
+    fileInput("file1", "Choose CSV File", accept = c("text/csv","text/comma-separated-values,text/plain",".csv")),
+    width=4),
+    mainPanel(HTML("Upload your dataset using the controls on the left.  Note that an example data set has already been uploaded for illustration.  Click the '<b>Header</b>' box if the data set to be uploaded has a header.  Then select the type of separator: comma (.csv), semicolon, or tab (.tsv).  Finally, specify the format used to define the time associated with each row if appropriate.  The month, day and year should be provided for each instrument run.  Hours, minutes and seconds will be used if provided, but are not mandatory.  By default, the first column of the dataset is used as the time stamp, but that can be changed by inputting the correct number under '<b>Date Column Number</b>'. Or, if there is no date then either put '0' for the date column number or select the '<b>No Dates</b>' option under '<b>Date Format</b>'.  If time information is provided then the data set will be ordered chronologically; if no date information is provided then the data is assumed to be ordered chronologically.  Finally, it is assumed that all of the remaining columns contain numeric data, all of which will be used to compute the QC-ART scores.<br/><br/>  
+    Once all of the options are chosen, press the '<b>Browse...</b>' button to search your computer for the dataset to upload.  As soon as the upload is complete, QC-ART scores and threshold values will be computed for each instrument run.  To ensure the data were read into R correctly, the uploaded data are displayed as a table.<br/><br/>
+    If a plot of the QC-ART scores does not appear below the data table, please verify the data were read as expected.  Again, it is assumed that the first row of the data set is the time stamp; if that is not true then that could be the source of the error.  If the text <font color='red'><b>Error:</b> 0 (non-NA) cases</font> appears instead of the plot of QC-ART scores, then the chosen '<b>Date Format</b>' is not correct, please change the 'Date Format' option to reflect the order that appears in the table above.<br/><br/>
+    Please direct all bugs or requested functionality to <a href='mailto:bryan.stanfill@pnnl.gov'>bryan.stanfill@pnnl.gov</a>.
+    <br/><br/>
+    The R code used to compute QC-ART scores and thresholds is freely available on GitHub: <a href='https://github.com/stanfill/QC-ART'>https://github.com/stanfill/QC-ART</a>."))),
+  
+  HTML("<br/><br/>
+       <b>Please verify the data below were uploaded correctly.</b>
+       <br/><br/>"),
+  dataTableOutput("dataPeak"),
+  HTML("<br/><br/><br/>
+       Below are the QC-ART scores computed on the uploaded data along with static (solid line) and dynamic (dashed lines) threshold values if plotted.  The size of the baseline can be altered using the '<b>Baseline size</b>' slider bar.  If a baseline size larger than the provided data set is provided, the full dataset will be used as a baseline.  The score tuning parameter can be changed using the '<b>Tuning Parameter (&alpha;)</b>' bar.   The &alpha; tuning parameter determines the number of principal components retained when the raw QC metrics are projected into a lower dimensional space; larger tuning parameter values imply more principal components are retained.  For more details, see the <b>Details on Scoring Algorithm</b> section of the Supplemental Material.  By default, no threshold lines are plotted, but they can be added by selecting one of the four radio buttons under the heading '<b>Threshold type</b>'.  The results can be downloaded as a .csv file using the '<b>Download Results</b>' button below.  The figure is interactive, you can zoom into and hover over points to get details.
+       <br/><br/>"),
+  #Download data button
+  inputPanel(
+    sliderInput("bsize","Baseline size",min=1,max=100,value=50),
+    sliderInput("pc_prop",HTML("Tuning Parameter (&alpha;)"),min=.75,max=1,value=.99,step=0.01),
+    radioButtons("thresh", "Threshold type",choices = c("Static","Dynamic","Both","Neither"),selected = "Neither",inline=TRUE),
+    downloadButton("downloadData","Download Results")),
+  #Scores figure
+  plotlyOutput("heat")
+)
+
+
+```
+
+
+```{r server}
+server <- function(input, output, session){
+  #library(QCART)
+  library(dlm)
+  source("compute_scores.R")
+  source("threshold_funs.R")
+  library(ggplot2)
+  library(dplyr)
+  library(lubridate)
+  
+  computeScores <- reactive({
+    # Fetch the appropriate data object, depending on the value
+    # of input$dataset.
+    if(is.null(input$file1$datapath)){
+      load("amidan_test_data.RData")
+    }else{
+      fpath <- input$file1$datapath
+      alldata <- read.csv(fpath, header = input$header, sep = input$sep)
+    }
+
+    
+    #Which column is the time indicator? Get it from inpu
+    date_col <- input$date_col
+    #print(date_col)
+    #date_col <- NULL
+    #for(i in 1:ncol(alldata)){
+    #  if(!(class(alldata[,i])%in%c("integer","numeric")))
+    #    date_col <- c(date_col,i)
+    #}
+  
+    maxb <- min(input$bsize,nrow(alldata))
+    bline_ob <- 1:maxb
+    bline <- rep(FALSE,nrow(alldata))
+    bline[bline_ob] <- TRUE  
+
+    
+    #Handle the case where a date column is provided
+    if(input$dformat!="nd" & input$date_col>0){
+      
+      alldata[,date_col] <- parse_date_time(alldata[,date_col],paste(input$dformat,c("","HM","HMS")))
+      alldata <- arrange(alldata,alldata[,date_col])
+      alldata$Baseline <- bline
+      #Remove the date column and "Baseline" column from alldata
+      vars <- colnames(alldata)[-c(date_col,ncol(alldata))]
+      data_X <- data.matrix(alldata[,-c(date_col,ncol(alldata))])
+      
+      scores <- qcart(data_X, bline,variables = vars,prop=input$pc_prop)
+      alldata$Score <- scores
+      alldata$Time <- alldata[,date_col]
+      
+    }else{
+      
+      alldata$Baseline <- bline
+      vars <- colnames(alldata)[-ncol(alldata)]
+      data_X <- data.matrix(alldata[,-ncol(alldata)])
+      scores <- qcart(data_X, bline,variables = vars,prop=input$pc_prop)
+      alldata$Score <- scores
+      alldata$Time <- 1:nrow(alldata)
+      
+    }
+    
+    return(alldata)
+  })
+  
+  ##-----------------------------------------##
+  # Create a table of the data for verification
+  output$dataPeak <- renderDataTable({
+    # Fetch the appropriate data object, depending on the value
+    # of input$dataset.
+    if(is.null(input$file1$datapath)){
+      load("amidan_test_data.RData")
+    }else{
+      fpath <- input$file1$datapath
+      alldata <- read.csv(fpath, header = input$header, sep = input$sep)
+    }
+    
+
+    min_col <- min(ncol(alldata),10)
+    return(alldata)
+  },options=list(pageLength=5,lengthMenu=c(5,10,20,30)))
+  
+  ##-----------------------------------------##
+  # Create the plot of scores
+  output$heat <- renderPlotly({
+    alldata <- computeScores()
+    
+    if(input$thresh!="Neither"){
+      #If time stamps are given, use them
+      if(input$dformat!="nd" & input$date_col>0){
+        s_threshold <- compute_threshold(scores = alldata$Score, baseline = alldata$Baseline, 
+                                         time_stamps = alldata$Time, type=input$thresh)
+        thresh_df <- s_threshold$Results  
+      }else{
+        #Otherwise, make some up (evenly space)
+        tseq <- ymd("20010101")+ddays(1:nrow(alldata))
+        s_threshold <- compute_threshold(scores = alldata$Score, baseline = alldata$Baseline, 
+                                        time_stamps = tseq, type=input$thresh)
+        
+        thresh_df <- s_threshold$Results  
+        thresh_df$Time_Stamp <- 1:nrow(thresh_df) #Don't use the fake time stamps for plotting
+      }
+    }
+    
+
+    
+    #Set reasonable y range values
+    maxy <- max(alldata$Score)*2
+    miny <- min(alldata$Score)
+    #Take off some of the digits to keep things manageable
+    alldata$Score <- round(alldata$Score,digits=5)
+    p1 <- ggplot(alldata)+geom_point(aes(Time,Score,colour=Baseline,text=paste("Time:",alldata$Time)))+ylim(c(miny,maxy))+
+      xlab("")+ylab("QC-ART Score")
+    if(input$thresh=="Static"||input$thresh=="Both"){
+      p1 <- p1+geom_line(aes(Time_Stamp,Static_Threshold),data=thresh_df,colour=1,linetype=1)
+    }
+    
+    if(input$thresh=="Dynamic"||input$thresh=="Both"){
+      p1 <- p1+geom_line(aes(Time_Stamp,Dynamic_Threshold),data=thresh_df,colour=1,linetype="twodash")
+    }
+
+    ggplotly(p1,tooltip=c("text","y"))
+    
+  })
+  
+  #Download button
+  output$downloadData <- downloadHandler(
+    
+    # This function returns a string which tells the client
+    # browser what name to use when saving the file.
+    filename = function() {
+      
+      if(is.null(input$file1$datapath)){
+        fpath <- "amidan_test_data.csv"
+      }else{
+        fpath <- input$file1$datapath
+      }
+      
+      temp <- gsub(".csv","",rev(strsplit(fpath,"/")[[1]])[1])
+		  paste0(temp,"_QC_ART_Results.csv")
+	  },
+
+    # This function should write data to a file given to it by
+    # the argument 'file'.
+    content = function(file) {
+      # Write to a file specified by the 'file' argument
+      df <- computeScores()
+      df <- df[,-which(colnames(df)=="Time")]
+      colnames(df)[which(colnames(df)=="Score")] <- "QC-Art Score"
+      write.csv(df, file, row.names = FALSE)
+    }
+  )
+}
+```
+
+
+
+
+```{r, echo=FALSE}
+shinyApp(ui, server,options=list(height=1900))
+```
